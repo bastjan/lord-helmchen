@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"go.yaml.in/yaml/v4"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -10,34 +12,48 @@ import (
 )
 
 const chartMajorVersion = "1"
-const chartName = "vshnjuiceshop"
 
-const kind = "JuiceShop"
-const listKind = "JuiceShopList"
-const plural = "juiceshops"
-const singular = "juiceshop"
+const crdKindAnnotation = "crd.bundle.appcat.io/kind"
+const crdListKindAnnotation = "crd.bundle.appcat.io/listKind"
+const crdSingularAnnotation = "crd.bundle.appcat.io/singular"
+const crdPluralAnnotation = "crd.bundle.appcat.io/plural"
+
+type chart struct {
+	Name        string            `yaml:"name"`
+	Annotations map[string]string `yaml:"annotations"`
+}
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Println("Usage: go run crdgen.go <values.yaml>")
+		fmt.Println("Usage: go run crdgen.go <chart_directory>")
 		os.Exit(1)
 	}
-	valuesFile := os.Args[1]
+	chartDir := os.Args[1]
 
-	schema, err := schema(valuesFile)
+	schema, err := schema(filepath.Join(chartDir, "values.yaml"))
 	if err != nil {
+		panic(err)
+	}
+	var chart chart
+	chartFile := filepath.Join(chartDir, "Chart.yaml")
+	data, err := os.ReadFile(chartFile)
+	if err != nil {
+		panic(err)
+	}
+	if err := yaml.Unmarshal(data, &chart); err != nil {
 		panic(err)
 	}
 
 	var crd apiextv1.CustomResourceDefinition
 	crd.SetGroupVersionKind(apiextv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
-	group := fmt.Sprintf("v%s.%s.bundles.appcat.io", chartMajorVersion, chartName)
-	crd.Spec.Names.Kind = kind
-	crd.Spec.Names.ListKind = listKind
-	crd.Spec.Names.Plural = plural
-	crd.Spec.Names.Singular = singular
+	names, err := names(chart)
+	if err != nil {
+		panic(err)
+	}
+	crd.Spec.Names = names
 
-	crd.Name = fmt.Sprintf("%s.%s", plural, group)
+	group := fmt.Sprintf("v%s.%s.bundles.appcat.io", chartMajorVersion, chart.Name)
+	crd.Name = fmt.Sprintf("%s.%s", names.Plural, group)
 	crd.Spec.Group = group
 	crd.Spec.Versions = []apiextv1.CustomResourceDefinitionVersion{
 		{
@@ -56,6 +72,27 @@ func main() {
 		panic(err)
 	}
 	fmt.Println(string(yamlData))
+}
+
+func names(chart chart) (apiextv1.CustomResourceDefinitionNames, error) {
+	kind := chart.Annotations[crdKindAnnotation]
+	if kind == "" {
+		kind = "Instance"
+	}
+	plural := chart.Annotations[crdPluralAnnotation]
+	if plural == "" {
+		plural = strings.ToLower(kind) + "s"
+	}
+
+	listKind := chart.Annotations[crdListKindAnnotation]
+	singular := chart.Annotations[crdSingularAnnotation]
+
+	return apiextv1.CustomResourceDefinitionNames{
+		Kind:     kind,
+		ListKind: listKind,
+		Plural:   plural,
+		Singular: singular,
+	}, nil
 }
 
 func schema(valuesFile string) (apiextv1.JSONSchemaProps, error) {
