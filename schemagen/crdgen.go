@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rogpeppe/go-internal/semver"
+	"github.com/Masterminds/semver/v3"
 	"go.yaml.in/yaml/v4"
 	chartv2 "helm.sh/helm/v4/pkg/chart/v2"
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
@@ -69,11 +69,12 @@ func main() {
 	}
 	crd.Spec.Names = names
 
-	major := semver.Major("v" + chart.Metadata.Version)
-	if major == "" {
-		panic(fmt.Errorf("invalid chart version: %s", chart.Metadata.Version))
+	// https://github.com/helm/helm/blob/af25d22902ef9fdbf7c667f3a0744a8f5a9a8fc3/pkg/registry/client.go#L800
+	semver, err := semver.StrictNewVersion(strings.ReplaceAll(chart.Metadata.Version, "_", "+"))
+	if err != nil {
+		panic(fmt.Errorf("invalid strict chart version: %s", chart.Metadata.Version))
 	}
-	group := fmt.Sprintf("%s.%s.bundles.appcat.io", major, chart.Name())
+	group := fmt.Sprintf("v%d.%s.bundles.appcat.io", semver.Major(), chart.Name())
 	crd.Name = fmt.Sprintf("%s.%s", names.Plural, group)
 	crd.Spec.Group = group
 	crd.Spec.Scope = apiextv1.NamespaceScoped
@@ -156,7 +157,6 @@ func valuesSchema(rawValues []byte) (apiextv1.JSONSchemaProps, error) {
 		return apiextv1.JSONSchemaProps{}, fmt.Errorf("top-level YAML node is not a mapping")
 	}
 
-	// Convert the YAML node to JSON schema properties
 	schemaProps, err := convertYAMLNodeToJSONSchema(top, "")
 	if err != nil {
 		return apiextv1.JSONSchemaProps{}, err
