@@ -1,46 +1,63 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/rogpeppe/go-internal/semver"
 	"go.yaml.in/yaml/v4"
+	chartv2 "helm.sh/helm/v4/pkg/chart/v2"
+	"helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/registry"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	kubeyaml "sigs.k8s.io/yaml"
 )
-
-const chartMajorVersion = "1"
 
 const crdKindAnnotation = "crd.bundle.appcat.io/kind"
 const crdListKindAnnotation = "crd.bundle.appcat.io/listKind"
 const crdSingularAnnotation = "crd.bundle.appcat.io/singular"
 const crdPluralAnnotation = "crd.bundle.appcat.io/plural"
 
-type chart struct {
-	Name        string            `yaml:"name"`
-	Annotations map[string]string `yaml:"annotations"`
-}
-
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Println("Usage: go run crdgen.go <chart_directory>")
+		fmt.Println("Usage: go run crdgen.go [<chart_directory> | <chart_archive> | oci://<chart_reference>]")
 		os.Exit(1)
 	}
-	chartDir := os.Args[1]
+	chartDirOrFile := os.Args[1]
+	if strings.HasPrefix(chartDirOrFile, "oci://") {
+		downloadedTo, err := downloadChart(chartDirOrFile)
+		if err != nil {
+			panic(err)
+		}
+		defer os.RemoveAll(downloadedTo)
+		chartDirOrFile = downloadedTo
+	}
 
-	schema, err := valuesSchema(filepath.Join(chartDir, "values.yaml"))
+	chartLoader, err := loader.Loader(chartDirOrFile)
 	if err != nil {
 		panic(err)
 	}
-	var chart chart
-	chartFile := filepath.Join(chartDir, "Chart.yaml")
-	data, err := os.ReadFile(chartFile)
+	chart, err := chartLoader.Load()
 	if err != nil {
 		panic(err)
 	}
-	if err := yaml.Unmarshal(data, &chart); err != nil {
+
+	var valuesYaml []byte
+	for _, f := range chart.Raw {
+		if f.Name == "values.yaml" {
+			valuesYaml = f.Data
+			break
+		}
+	}
+	if valuesYaml == nil {
+		panic("values.yaml not found")
+	}
+
+	schema, err := valuesSchema(valuesYaml)
+	if err != nil {
 		panic(err)
 	}
 
@@ -52,7 +69,11 @@ func main() {
 	}
 	crd.Spec.Names = names
 
-	group := fmt.Sprintf("v%s.%s.bundles.appcat.io", chartMajorVersion, chart.Name)
+	major := semver.Major("v" + chart.Metadata.Version)
+	if major == "" {
+		panic(fmt.Errorf("invalid chart version: %s", chart.Metadata.Version))
+	}
+	group := fmt.Sprintf("%s.%s.bundles.appcat.io", major, chart.Name())
 	crd.Name = fmt.Sprintf("%s.%s", names.Plural, group)
 	crd.Spec.Group = group
 	crd.Spec.Scope = apiextv1.NamespaceScoped
@@ -97,18 +118,18 @@ func main() {
 	fmt.Println(string(yamlData))
 }
 
-func names(chart chart) (apiextv1.CustomResourceDefinitionNames, error) {
-	kind := chart.Annotations[crdKindAnnotation]
+func names(chart *chartv2.Chart) (apiextv1.CustomResourceDefinitionNames, error) {
+	kind := chart.Metadata.Annotations[crdKindAnnotation]
 	if kind == "" {
 		kind = "Instance"
 	}
-	plural := chart.Annotations[crdPluralAnnotation]
+	plural := chart.Metadata.Annotations[crdPluralAnnotation]
 	if plural == "" {
 		plural = strings.ToLower(kind) + "s"
 	}
 
-	listKind := chart.Annotations[crdListKindAnnotation]
-	singular := chart.Annotations[crdSingularAnnotation]
+	listKind := chart.Metadata.Annotations[crdListKindAnnotation]
+	singular := chart.Metadata.Annotations[crdSingularAnnotation]
 
 	return apiextv1.CustomResourceDefinitionNames{
 		Kind:     kind,
@@ -118,13 +139,9 @@ func names(chart chart) (apiextv1.CustomResourceDefinitionNames, error) {
 	}, nil
 }
 
-func valuesSchema(valuesFile string) (apiextv1.JSONSchemaProps, error) {
+func valuesSchema(rawValues []byte) (apiextv1.JSONSchemaProps, error) {
 	var node yaml.Node
-	data, err := os.ReadFile(valuesFile)
-	if err != nil {
-		return apiextv1.JSONSchemaProps{}, err
-	}
-	if err := yaml.Unmarshal(data, &node); err != nil {
+	if err := yaml.Unmarshal(rawValues, &node); err != nil {
 		return apiextv1.JSONSchemaProps{}, err
 	}
 
@@ -196,7 +213,8 @@ func convertYAMLNodeToJSONSchema(node *yaml.Node, path string) (apiextv1.JSONSch
 
 	case yaml.ScalarNode:
 		if node.Tag == "!!null" {
-			return apiextv1.JSONSchemaProps{Nullable: true}, nil
+			fmt.Fprintf(os.Stderr, "WARNING: Assuming string for null type at %s\n", path)
+			return apiextv1.JSONSchemaProps{Nullable: true, Type: "string"}, nil
 		}
 
 		var schemaType string
@@ -231,4 +249,31 @@ func stripComment(s string) string {
 		}
 	}
 	return strings.Join(strippedLines, "\n")
+}
+
+func downloadChart(chartRef string) (string, error) {
+	c, err := registry.NewClient()
+	if err != nil {
+		return "", err
+	}
+
+	res, err := c.Pull(chartRef,
+		registry.PullOptWithChart(true),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	cacheDir := filepath.Join(".", "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", err
+	}
+
+	sha := fmt.Sprintf("%x", sha256.Sum256([]byte(chartRef)))
+	filePath := filepath.Join(cacheDir, sha+".tgz")
+	if err := os.WriteFile(filePath, res.Chart.Data, 0644); err != nil {
+		return "", err
+	}
+
+	return filePath, nil
 }
