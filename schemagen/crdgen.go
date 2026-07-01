@@ -30,7 +30,7 @@ func main() {
 	}
 	chartDir := os.Args[1]
 
-	schema, err := schema(filepath.Join(chartDir, "values.yaml"))
+	schema, err := valuesSchema(filepath.Join(chartDir, "values.yaml"))
 	if err != nil {
 		panic(err)
 	}
@@ -55,17 +55,40 @@ func main() {
 	group := fmt.Sprintf("v%s.%s.bundles.appcat.io", chartMajorVersion, chart.Name)
 	crd.Name = fmt.Sprintf("%s.%s", names.Plural, group)
 	crd.Spec.Group = group
+	crd.Spec.Scope = apiextv1.NamespaceScoped
 	crd.Spec.Versions = []apiextv1.CustomResourceDefinitionVersion{
 		{
 			Name:    "bundle",
 			Served:  true,
 			Storage: true,
 			Schema: &apiextv1.CustomResourceValidation{
-				OpenAPIV3Schema: &schema,
+				OpenAPIV3Schema: &apiextv1.JSONSchemaProps{
+					Type: "object",
+					Properties: map[string]apiextv1.JSONSchemaProps{
+						"spec": {
+							Type:        "object",
+							Description: "Configures the desired state of the service.",
+							Properties: map[string]apiextv1.JSONSchemaProps{
+								"version": {
+									Type:        "string",
+									Description: "The version of the service. Every change to this field together with the `.spec.values` field creates a new revision of the service.",
+								},
+								"values": {
+									Type:        "object",
+									Description: "This field together with the `.spec.version` field defines the configuration of the service. Every change to either of these two fields creates a new revision of the service.",
+									Properties:  schema.Properties,
+								},
+								"desiredRevision": {
+									Type:        "string",
+									Description: "The desired revision of the service.",
+								},
+							},
+						},
+					},
+				},
 			},
 		},
 	}
-	crd.Spec.Scope = apiextv1.NamespaceScoped
 
 	yamlData, err := kubeyaml.Marshal(crd)
 	if err != nil {
@@ -95,7 +118,7 @@ func names(chart chart) (apiextv1.CustomResourceDefinitionNames, error) {
 	}, nil
 }
 
-func schema(valuesFile string) (apiextv1.JSONSchemaProps, error) {
+func valuesSchema(valuesFile string) (apiextv1.JSONSchemaProps, error) {
 	var node yaml.Node
 	data, err := os.ReadFile(valuesFile)
 	if err != nil {
@@ -145,7 +168,7 @@ func convertYAMLNodeToJSONSchema(node *yaml.Node, path string) (apiextv1.JSONSch
 			if err != nil {
 				return apiextv1.JSONSchemaProps{}, fmt.Errorf("at %s: %s", path, err)
 			}
-			valueSchema.Description = keyNode.HeadComment
+			valueSchema.Description = stripComment(keyNode.HeadComment)
 			props[keyNode.Value] = valueSchema
 		}
 
@@ -196,4 +219,16 @@ func convertYAMLNodeToJSONSchema(node *yaml.Node, path string) (apiextv1.JSONSch
 	default:
 		return apiextv1.JSONSchemaProps{}, fmt.Errorf("unsupported YAML node kind: %v", node.Kind)
 	}
+}
+
+func stripComment(s string) string {
+	lines := strings.Split(s, "\n")
+	strippedLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		strippedLine := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "#"))
+		if strippedLine != "" {
+			strippedLines = append(strippedLines, strippedLine)
+		}
+	}
+	return strings.Join(strippedLines, "\n")
 }
